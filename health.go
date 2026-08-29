@@ -148,6 +148,7 @@ func (m *MatchDNSBL) startHealthChecks(ctx context.Context) {
 	for i := range m.rules {
 		rule := &m.rules[i]
 		if rule.health != nil {
+			m.metrics.setProviderHealth(rule.zone, providerHealthUnknown)
 			go m.monitorProviderHealth(ctx, rule)
 		}
 	}
@@ -186,7 +187,8 @@ func (m *MatchDNSBL) checkProviderHealth(ctx context.Context, rule *providerRule
 	for _, control := range controls {
 		control := control
 		go func() {
-			resolved, err := m.resolveFresh(checkCtx, dnsblQuery(control.address, rule.zone), m.lookupDNS)
+			resolved, err := m.resolveFresh(checkCtx, dnsblQuery(control.address, rule.zone), m.instrumentLookup(rule.zone, m.lookupDNS))
+			m.recordResolveMetrics(rule.zone, resolved, err)
 			results <- healthControlResult{
 				positive: control.positive,
 				response: resolved.response,
@@ -231,6 +233,7 @@ healthResults:
 		(negative.response.rcode == dnsRcodeSuccess && len(negative.response.addresses) == 0))
 	healthy := positiveOK && negativeOK
 	previous, current, changed := rule.health.update(healthy)
+	m.metrics.setProviderHealth(rule.zone, current)
 	if !changed {
 		return
 	}

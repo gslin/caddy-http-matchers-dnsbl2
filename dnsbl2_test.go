@@ -472,6 +472,72 @@ func TestMatchWithErrorListed(t *testing.T) {
 	}
 }
 
+func TestMatchWithErrorSetsRequestVariables(t *testing.T) {
+	matcher := MatchDNSBL{
+		ProviderConfigs: []Provider{{
+			Zone:    "dnsbl.example.",
+			Answers: []string{"127.0.0.38"},
+		}},
+		Timeout: caddy.Duration(time.Second),
+		lookupDNS: func(context.Context, string) (dnsResponse, error) {
+			return dnsResponse{
+				addresses: []netip.Addr{netip.MustParseAddr("127.0.0.38")},
+				rcode:     dnsRcodeSuccess,
+			}, nil
+		},
+	}
+	request := newRequest("192.0.2.45:1234")
+	variables := map[string]any{
+		"dnsbl2.provider": "stale.example.",
+		"dnsbl2.answer":   "127.0.0.9",
+	}
+	request = request.WithContext(context.WithValue(request.Context(), caddyhttp.VarsCtxKey, variables))
+
+	matched, err := matcher.MatchWithError(request)
+	if err != nil {
+		t.Fatalf("match: %v", err)
+	}
+	if !matched {
+		t.Fatal("expected request to match")
+	}
+	if got, want := caddyhttp.GetVar(request.Context(), "dnsbl2.provider"), "dnsbl.example."; got != want {
+		t.Fatalf("provider variable = %v, want %q", got, want)
+	}
+	if got, want := caddyhttp.GetVar(request.Context(), "dnsbl2.answer"), "127.0.0.38"; got != want {
+		t.Fatalf("answer variable = %v, want %q", got, want)
+	}
+}
+
+func TestMatchWithErrorClearsRequestVariables(t *testing.T) {
+	matcher := MatchDNSBL{
+		Providers: []string{"dnsbl.example."},
+		Timeout:   caddy.Duration(time.Second),
+		lookupDNS: func(context.Context, string) (dnsResponse, error) {
+			return dnsResponse{rcode: dnsRcodeNameError}, nil
+		},
+	}
+	request := newRequest("192.0.2.45:1234")
+	variables := map[string]any{
+		"dnsbl2.provider": "stale.example.",
+		"dnsbl2.answer":   "127.0.0.9",
+	}
+	request = request.WithContext(context.WithValue(request.Context(), caddyhttp.VarsCtxKey, variables))
+
+	matched, err := matcher.MatchWithError(request)
+	if err != nil {
+		t.Fatalf("match: %v", err)
+	}
+	if matched {
+		t.Fatal("unexpected match")
+	}
+	if got := caddyhttp.GetVar(request.Context(), "dnsbl2.provider"); got != nil {
+		t.Fatalf("provider variable = %v, want nil", got)
+	}
+	if got := caddyhttp.GetVar(request.Context(), "dnsbl2.answer"); got != nil {
+		t.Fatalf("answer variable = %v, want nil", got)
+	}
+}
+
 func TestMatchWithErrorFiltersProviderAnswers(t *testing.T) {
 	tests := []struct {
 		name      string

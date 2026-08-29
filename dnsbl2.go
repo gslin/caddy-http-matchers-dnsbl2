@@ -88,6 +88,7 @@ type MatchDNSBL struct {
 	cache       *responseCache
 	coordinator *lookupCoordinator
 	cancel      context.CancelFunc
+	metrics     *dnsblMetrics
 }
 
 type lookupResult struct {
@@ -95,6 +96,8 @@ type lookupResult struct {
 	listed   bool
 	answer   string
 	rcode    int
+	cacheHit bool
+	shared   bool
 	err      error
 }
 
@@ -167,6 +170,11 @@ func (m *MatchDNSBL) Provision(ctx caddy.Context) error {
 		}
 	}
 	m.logger = ctx.Logger()
+	metrics, err := registerDNSBLMetrics(ctx.GetMetricsRegistry())
+	if err != nil {
+		return err
+	}
+	m.metrics = metrics
 	m.startHealthChecks(lifetime)
 
 	return nil
@@ -368,6 +376,8 @@ func (m *MatchDNSBL) Match(r *http.Request) bool {
 // MatchWithError reports whether the request's client IP is listed by any
 // configured provider. DNS errors fail open and do not match.
 func (m *MatchDNSBL) MatchWithError(r *http.Request) (bool, error) {
+	caddyhttp.SetVar(r.Context(), "dnsbl2.provider", nil)
+	caddyhttp.SetVar(r.Context(), "dnsbl2.answer", nil)
 	clientIP, err := requestClientIP(r)
 	if err != nil {
 		m.logDebug("invalid client IP", zap.String("address", requestClientAddress(r)), zap.Error(err))
@@ -406,7 +416,8 @@ func (m *MatchDNSBL) MatchWithError(r *http.Request) (bool, error) {
 		query := dnsblQuery(clientIP, rule.zone)
 
 		go func() {
-			resolved, lookupErr := m.resolve(ctx, query, lookupDNS)
+			resolved, lookupErr := m.resolve(ctx, query, m.instrumentLookup(rule.zone, lookupDNS))
+			m.recordResolveMetrics(rule.zone, resolved, lookupErr)
 			response := resolved.response
 			answer, listed := matchingAnswer(response.addresses, rule.answers)
 			results <- lookupResult{
@@ -414,6 +425,8 @@ func (m *MatchDNSBL) MatchWithError(r *http.Request) (bool, error) {
 				listed:   lookupErr == nil && response.rcode == dnsRcodeSuccess && listed,
 				answer:   answer,
 				rcode:    response.rcode,
+				cacheHit: resolved.cacheHit,
+				shared:   resolved.shared,
 				err:      lookupErr,
 			}
 		}()
@@ -433,6 +446,14 @@ func (m *MatchDNSBL) MatchWithError(r *http.Request) (bool, error) {
 				continue
 			}
 			if result.listed {
+				caddyhttp.SetVar(r.Context(), "dnsbl2.provider", result.provider)
+				caddyhttp.SetVar(r.Context(), "dnsbl2.answer", result.answer)
+				m.logDebug("DNSBL request matched",
+					zap.String("client_ip", clientIP.String()),
+					zap.String("provider", result.provider),
+					zap.String("answer", result.answer),
+					zap.Bool("cache_hit", result.cacheHit),
+					zap.Bool("coalesced", result.shared))
 				return true, nil
 			}
 
