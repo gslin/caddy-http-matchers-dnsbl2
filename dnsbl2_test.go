@@ -81,6 +81,39 @@ func TestUnmarshalCaddyfileProviderAnswers(t *testing.T) {
 	}
 }
 
+func TestUnmarshalCaddyfileHealthCheck(t *testing.T) {
+	d := caddyfile.NewTestDispenser(`
+		dnsbl2 {
+			provider spam.spamrats.com. {
+				answers 127.0.0.38
+				health_check {
+					positive 127.0.0.38
+					negative 127.0.0.1
+					interval 30s
+				}
+			}
+		}
+	`)
+
+	var matcher MatchDNSBL
+	if err := matcher.UnmarshalCaddyfile(d); err != nil {
+		t.Fatalf("unmarshal Caddyfile: %v", err)
+	}
+	check := matcher.ProviderConfigs[0].HealthCheck
+	if check == nil {
+		t.Fatal("health check was not configured")
+	}
+	if got, want := check.Positive, "127.0.0.38"; got != want {
+		t.Fatalf("positive address = %q, want %q", got, want)
+	}
+	if got, want := check.Negative, "127.0.0.1"; got != want {
+		t.Fatalf("negative address = %q, want %q", got, want)
+	}
+	if got, want := time.Duration(check.Interval), 30*time.Second; got != want {
+		t.Fatalf("interval = %s, want %s", got, want)
+	}
+}
+
 func TestUnmarshalCaddyfileResolvers(t *testing.T) {
 	d := caddyfile.NewTestDispenser(`
 		dnsbl2 {
@@ -177,6 +210,51 @@ func TestUnmarshalCaddyfileRejectsInvalidConfiguration(t *testing.T) {
 			dnsbl2 {
 				provider example.test {
 					unknown value
+				}
+			}
+		`,
+		"invalid health positive": `
+			dnsbl2 {
+				provider example.test {
+					health_check {
+						positive invalid
+					}
+				}
+			}
+		`,
+		"same health controls": `
+			dnsbl2 {
+				provider example.test {
+					health_check {
+						positive 127.0.0.2
+						negative 127.0.0.2
+					}
+				}
+			}
+		`,
+		"invalid health interval": `
+			dnsbl2 {
+				provider example.test {
+					health_check {
+						interval 0s
+					}
+				}
+			}
+		`,
+		"unknown health option": `
+			dnsbl2 {
+				provider example.test {
+					health_check {
+						unknown value
+					}
+				}
+			}
+		`,
+		"duplicate health check": `
+			dnsbl2 {
+				provider example.test {
+					health_check
+					health_check
 				}
 			}
 		`,

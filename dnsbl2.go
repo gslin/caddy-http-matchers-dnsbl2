@@ -34,6 +34,23 @@ type Provider struct {
 	// Answers limits matches to these IPv4 answers. Any A record matches when
 	// Answers is empty.
 	Answers []string `json:"answers,omitempty"`
+
+	// HealthCheck periodically verifies positive and negative control entries.
+	HealthCheck *ProviderHealthCheck `json:"health_check,omitempty"`
+}
+
+// ProviderHealthCheck configures RFC 5782 control queries for a provider.
+type ProviderHealthCheck struct {
+	// Positive is an IP address that must be listed. It defaults to the first
+	// configured answer, or 127.0.0.2 when any answer is accepted.
+	Positive string `json:"positive,omitempty"`
+
+	// Negative is an IP address that must not be listed. It defaults to
+	// 127.0.0.1.
+	Negative string `json:"negative,omitempty"`
+
+	// Interval is the time between checks. It defaults to 5 minutes.
+	Interval caddy.Duration `json:"interval,omitempty"`
 }
 
 // MatchDNSBL matches requests whose client IP is listed by at least one DNSBL
@@ -70,6 +87,7 @@ type MatchDNSBL struct {
 	rules       []providerRule
 	cache       *responseCache
 	coordinator *lookupCoordinator
+	cancel      context.CancelFunc
 }
 
 type lookupResult struct {
@@ -83,6 +101,7 @@ type lookupResult struct {
 type providerRule struct {
 	zone    string
 	answers map[netip.Addr]struct{}
+	health  *providerHealth
 }
 
 func init() {
@@ -111,6 +130,7 @@ func (m *MatchDNSBL) Provision(ctx caddy.Context) error {
 		for j, answer := range m.ProviderConfigs[i].Answers {
 			m.ProviderConfigs[i].Answers[j] = netip.MustParseAddr(answer).Unmap().String()
 		}
+		normalizeHealthCheck(&m.ProviderConfigs[i])
 	}
 	m.rules = m.compileProviderRules()
 	if m.Timeout == 0 {
@@ -126,7 +146,12 @@ func (m *MatchDNSBL) Provision(ctx caddy.Context) error {
 	if m.MaxConcurrent == 0 {
 		m.MaxConcurrent = defaultMaxConcurrent
 	}
-	m.coordinator = newLookupCoordinator(ctx.Context, time.Duration(m.Timeout), m.MaxConcurrent, m.cache)
+	lifetime := ctx.Context
+	if lifetime == nil {
+		lifetime = context.Background()
+	}
+	lifetime, m.cancel = context.WithCancel(lifetime)
+	m.coordinator = newLookupCoordinator(lifetime, time.Duration(m.Timeout), m.MaxConcurrent, m.cache)
 	for i, resolver := range m.Resolvers {
 		m.Resolvers[i], _ = normalizeResolverAddress(resolver, "53")
 	}
@@ -142,6 +167,7 @@ func (m *MatchDNSBL) Provision(ctx caddy.Context) error {
 		}
 	}
 	m.logger = ctx.Logger()
+	m.startHealthChecks(lifetime)
 
 	return nil
 }
@@ -197,6 +223,9 @@ func (m *MatchDNSBL) Validate() error {
 			}
 			answerSeen[address] = struct{}{}
 		}
+		if err := validateHealthCheck(provider); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -208,6 +237,11 @@ func (m *MatchDNSBL) Validate() error {
 //		providers <zones...>
 //		provider <zone> {
 //			answers <IPv4 addresses...>
+//			health_check {
+//				positive <IP address>
+//				negative <IP address>
+//				interval <duration>
+//			}
 //		}
 //		timeout <duration>
 //		resolvers <IP addresses...>
@@ -246,6 +280,15 @@ func (m *MatchDNSBL) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 							return d.ArgErr()
 						}
 						provider.Answers = append(provider.Answers, answers...)
+					case "health_check":
+						if provider.HealthCheck != nil {
+							return d.Err("health_check already specified")
+						}
+						healthCheck, err := unmarshalHealthCheck(d)
+						if err != nil {
+							return err
+						}
+						provider.HealthCheck = healthCheck
 					default:
 						return d.Errf("unrecognized dnsbl2 provider option: %s", d.Val())
 					}
@@ -342,7 +385,13 @@ func (m *MatchDNSBL) MatchWithError(r *http.Request) (bool, error) {
 	if len(rules) == 0 {
 		rules = m.compileProviderRules()
 	}
-	results := make(chan lookupResult, len(rules))
+	activeRules := make([]providerRule, 0, len(rules))
+	for _, rule := range rules {
+		if rule.health == nil || rule.health.available() {
+			activeRules = append(activeRules, rule)
+		}
+	}
+	results := make(chan lookupResult, len(activeRules))
 	lookupDNS := m.lookupDNS
 	if lookupDNS == nil {
 		lookupIP := m.lookupIP
@@ -352,7 +401,7 @@ func (m *MatchDNSBL) MatchWithError(r *http.Request) (bool, error) {
 		lookupDNS = lookupDNSFromLookupIP(lookupIP)
 	}
 
-	for _, rule := range rules {
+	for _, rule := range activeRules {
 		rule := rule
 		query := dnsblQuery(clientIP, rule.zone)
 
@@ -370,7 +419,7 @@ func (m *MatchDNSBL) MatchWithError(r *http.Request) (bool, error) {
 		}()
 	}
 
-	for range rules {
+	for range activeRules {
 		select {
 		case result := <-results:
 			if result.err != nil {
@@ -472,19 +521,36 @@ func (m *MatchDNSBL) compileProviderRules() []providerRule {
 		rules = append(rules, providerRule{zone: normalizeProvider(provider)})
 	}
 	for _, provider := range m.ProviderConfigs {
-		rule := providerRule{
-			zone:    normalizeProvider(provider.Zone),
-			answers: make(map[netip.Addr]struct{}, len(provider.Answers)),
+		configuredProvider := provider
+		if provider.HealthCheck != nil {
+			healthCheck := *provider.HealthCheck
+			configuredProvider.HealthCheck = &healthCheck
 		}
-		for _, answer := range provider.Answers {
+		normalizeHealthCheck(&configuredProvider)
+		rule := providerRule{
+			zone:    normalizeProvider(configuredProvider.Zone),
+			answers: make(map[netip.Addr]struct{}, len(configuredProvider.Answers)),
+		}
+		for _, answer := range configuredProvider.Answers {
 			address, err := netip.ParseAddr(answer)
 			if err == nil {
 				rule.answers[address.Unmap()] = struct{}{}
 			}
 		}
+		if configuredProvider.HealthCheck != nil {
+			rule.health = newProviderHealth(*configuredProvider.HealthCheck)
+		}
 		rules = append(rules, rule)
 	}
 	return rules
+}
+
+// Cleanup stops background health checks and active DNS lookups.
+func (m *MatchDNSBL) Cleanup() error {
+	if m.cancel != nil {
+		m.cancel()
+	}
+	return nil
 }
 
 func matchingAnswer(addresses []netip.Addr, accepted map[netip.Addr]struct{}) (string, bool) {
@@ -529,6 +595,7 @@ func (m *MatchDNSBL) logDebug(message string, fields ...zap.Field) {
 var (
 	_ caddy.Module                      = (*MatchDNSBL)(nil)
 	_ caddy.Provisioner                 = (*MatchDNSBL)(nil)
+	_ caddy.CleanerUpper                = (*MatchDNSBL)(nil)
 	_ caddy.Validator                   = (*MatchDNSBL)(nil)
 	_ caddyfile.Unmarshaler             = (*MatchDNSBL)(nil)
 	_ caddyhttp.RequestMatcher          = (*MatchDNSBL)(nil)

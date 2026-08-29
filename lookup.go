@@ -47,14 +47,26 @@ func newLookupCoordinator(ctx context.Context, timeout time.Duration, maxConcurr
 }
 
 func (c *lookupCoordinator) resolve(ctx context.Context, query string, lookupDNS lookupDNSFunc) (resolveResult, error) {
-	if response, ok := c.cached(query); ok {
-		return resolveResult{response: response, cacheHit: true}, nil
+	return c.resolveWithCache(ctx, query, lookupDNS, true)
+}
+
+func (c *lookupCoordinator) resolveFresh(ctx context.Context, query string, lookupDNS lookupDNSFunc) (resolveResult, error) {
+	return c.resolveWithCache(ctx, query, lookupDNS, false)
+}
+
+func (c *lookupCoordinator) resolveWithCache(ctx context.Context, query string, lookupDNS lookupDNSFunc, useCache bool) (resolveResult, error) {
+	if useCache {
+		if response, ok := c.cached(query); ok {
+			return resolveResult{response: response, cacheHit: true}, nil
+		}
 	}
 
 	c.mu.Lock()
-	if response, ok := c.cached(query); ok {
-		c.mu.Unlock()
-		return resolveResult{response: response, cacheHit: true}, nil
+	if useCache {
+		if response, ok := c.cached(query); ok {
+			c.mu.Unlock()
+			return resolveResult{response: response, cacheHit: true}, nil
+		}
 	}
 	if call, ok := c.inflight[query]; ok {
 		call.waiters++
@@ -159,4 +171,12 @@ func (m *MatchDNSBL) resolve(ctx context.Context, query string, lookupDNS lookup
 		m.cache.put(query, response)
 	}
 	return resolveResult{response: response}, nil
+}
+
+func (m *MatchDNSBL) resolveFresh(ctx context.Context, query string, lookupDNS lookupDNSFunc) (resolveResult, error) {
+	if m.coordinator != nil {
+		return m.coordinator.resolveFresh(ctx, query, lookupDNS)
+	}
+	response, err := lookupDNS(ctx, query)
+	return resolveResult{response: response}, err
 }
