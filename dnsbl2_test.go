@@ -81,6 +81,23 @@ func TestUnmarshalCaddyfileProviderAnswers(t *testing.T) {
 	}
 }
 
+func TestUnmarshalCaddyfileResolvers(t *testing.T) {
+	d := caddyfile.NewTestDispenser(`
+		dnsbl2 {
+			providers dnsbl.example
+			resolvers 127.0.0.1:5353 ::1
+		}
+	`)
+
+	var matcher MatchDNSBL
+	if err := matcher.UnmarshalCaddyfile(d); err != nil {
+		t.Fatalf("unmarshal Caddyfile: %v", err)
+	}
+	if got, want := strings.Join(matcher.Resolvers, ","), "127.0.0.1:5353,::1"; got != want {
+		t.Fatalf("resolvers = %q, want %q", got, want)
+	}
+}
+
 func TestUnmarshalCaddyfileRejectsInvalidConfiguration(t *testing.T) {
 	tests := map[string]string{
 		"inline arguments":  `dnsbl2 example.test`,
@@ -123,6 +140,24 @@ func TestUnmarshalCaddyfileRejectsInvalidConfiguration(t *testing.T) {
 				provider example.test {
 					unknown value
 				}
+			}
+		`,
+		"empty resolvers": `
+			dnsbl2 {
+				providers example.test
+				resolvers
+			}
+		`,
+		"invalid resolver": `
+			dnsbl2 {
+				providers example.test
+				resolvers resolver.example
+			}
+		`,
+		"duplicate resolver": `
+			dnsbl2 {
+				providers example.test
+				resolvers 127.0.0.1 127.0.0.1:53
 			}
 		`,
 	}
@@ -168,7 +203,7 @@ func TestProvision(t *testing.T) {
 	if got, want := time.Duration(matcher.Timeout), defaultLookupTimeout; got != want {
 		t.Fatalf("timeout = %s, want %s", got, want)
 	}
-	if matcher.lookupIP == nil {
+	if matcher.lookupDNS == nil {
 		t.Fatal("resolver was not configured")
 	}
 }
@@ -359,6 +394,27 @@ func TestMatchWithErrorFailsOpenOnDNSErrors(t *testing.T) {
 				t.Fatal("DNS error must not match")
 			}
 		})
+	}
+}
+
+func TestMatchWithErrorFailsOpenOnUnsuccessfulRcode(t *testing.T) {
+	matcher := MatchDNSBL{
+		Providers: []string{"dnsbl.example."},
+		Timeout:   caddy.Duration(time.Second),
+		lookupDNS: func(context.Context, string) (dnsResponse, error) {
+			return dnsResponse{
+				addresses: []netip.Addr{netip.MustParseAddr("127.0.0.2")},
+				rcode:     2,
+			}, nil
+		},
+	}
+
+	matched, err := matcher.MatchWithError(newRequest("192.0.2.45:1234"))
+	if err != nil {
+		t.Fatalf("match: %v", err)
+	}
+	if matched {
+		t.Fatal("unsuccessful DNS response must not match")
 	}
 }
 

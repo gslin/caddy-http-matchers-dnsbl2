@@ -43,15 +43,21 @@ type MatchDNSBL struct {
 	// The default is 2 seconds.
 	Timeout caddy.Duration `json:"timeout,omitempty"`
 
-	lookupIP lookupIPFunc
-	logger   *zap.Logger
-	rules    []providerRule
+	// Resolvers is an optional list of DNS resolver IP addresses with optional
+	// ports. The operating system configuration is used by default.
+	Resolvers []string `json:"resolvers,omitempty"`
+
+	lookupIP  lookupIPFunc
+	lookupDNS lookupDNSFunc
+	logger    *zap.Logger
+	rules     []providerRule
 }
 
 type lookupResult struct {
 	provider string
 	listed   bool
 	answer   string
+	rcode    int
 	err      error
 }
 
@@ -91,8 +97,19 @@ func (m *MatchDNSBL) Provision(ctx caddy.Context) error {
 	if m.Timeout == 0 {
 		m.Timeout = caddy.Duration(defaultLookupTimeout)
 	}
-	if m.lookupIP == nil {
-		m.lookupIP = net.DefaultResolver.LookupIP
+	for i, resolver := range m.Resolvers {
+		m.Resolvers[i], _ = normalizeResolverAddress(resolver, "53")
+	}
+	if m.lookupDNS == nil {
+		if m.lookupIP != nil {
+			m.lookupDNS = lookupDNSFromLookupIP(m.lookupIP)
+		} else {
+			lookupDNS, err := newLookupDNS(m.Resolvers, time.Duration(m.Timeout))
+			if err != nil {
+				return fmt.Errorf("configure DNS resolver: %w", err)
+			}
+			m.lookupDNS = lookupDNS
+		}
 	}
 	m.logger = ctx.Logger()
 
@@ -106,6 +123,17 @@ func (m *MatchDNSBL) Validate() error {
 	}
 	if m.Timeout < 0 {
 		return fmt.Errorf("timeout must be greater than zero")
+	}
+	resolverSeen := make(map[string]struct{}, len(m.Resolvers))
+	for _, resolver := range m.Resolvers {
+		normalized, err := normalizeResolverAddress(resolver, "53")
+		if err != nil {
+			return err
+		}
+		if _, ok := resolverSeen[normalized]; ok {
+			return fmt.Errorf("duplicate DNS resolver %q", resolver)
+		}
+		resolverSeen[normalized] = struct{}{}
 	}
 
 	seen := make(map[string]struct{}, len(m.Providers)+len(m.ProviderConfigs))
@@ -143,6 +171,7 @@ func (m *MatchDNSBL) Validate() error {
 //			answers <IPv4 addresses...>
 //		}
 //		timeout <duration>
+//		resolvers <IP addresses...>
 //	}
 func (m *MatchDNSBL) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
@@ -195,6 +224,13 @@ func (m *MatchDNSBL) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				m.Timeout = caddy.Duration(timeout)
 
+			case "resolvers":
+				resolvers := d.RemainingArgs()
+				if len(resolvers) == 0 {
+					return d.ArgErr()
+				}
+				m.Resolvers = append(m.Resolvers, resolvers...)
+
 			default:
 				return d.Errf("unrecognized dnsbl2 option: %s", d.Val())
 			}
@@ -232,9 +268,13 @@ func (m *MatchDNSBL) MatchWithError(r *http.Request) (bool, error) {
 		rules = m.compileProviderRules()
 	}
 	results := make(chan lookupResult, len(rules))
-	lookupIP := m.lookupIP
-	if lookupIP == nil {
-		lookupIP = net.DefaultResolver.LookupIP
+	lookupDNS := m.lookupDNS
+	if lookupDNS == nil {
+		lookupIP := m.lookupIP
+		if lookupIP == nil {
+			lookupIP = net.DefaultResolver.LookupIP
+		}
+		lookupDNS = lookupDNSFromLookupIP(lookupIP)
 	}
 
 	for _, rule := range rules {
@@ -242,12 +282,13 @@ func (m *MatchDNSBL) MatchWithError(r *http.Request) (bool, error) {
 		query := dnsblQuery(clientIP, rule.zone)
 
 		go func() {
-			addresses, lookupErr := lookupIP(ctx, "ip4", query)
-			answer, listed := matchingAnswer(addresses, rule.answers)
+			response, lookupErr := lookupDNS(ctx, query)
+			answer, listed := matchingAnswer(response.addresses, rule.answers)
 			results <- lookupResult{
 				provider: rule.zone,
-				listed:   lookupErr == nil && listed,
+				listed:   lookupErr == nil && response.rcode == dnsRcodeSuccess && listed,
 				answer:   answer,
+				rcode:    response.rcode,
 				err:      lookupErr,
 			}
 		}()
@@ -258,6 +299,12 @@ func (m *MatchDNSBL) MatchWithError(r *http.Request) (bool, error) {
 		case result := <-results:
 			if result.err != nil {
 				m.logDebug("DNSBL lookup failed", zap.String("provider", result.provider), zap.Error(result.err))
+				continue
+			}
+			if result.rcode != dnsRcodeSuccess {
+				m.logDebug("DNSBL lookup returned unsuccessful response",
+					zap.String("provider", result.provider),
+					zap.String("rcode", dnsRcodeName(result.rcode)))
 				continue
 			}
 			if result.listed {
@@ -364,13 +411,12 @@ func (m *MatchDNSBL) compileProviderRules() []providerRule {
 	return rules
 }
 
-func matchingAnswer(addresses []net.IP, accepted map[netip.Addr]struct{}) (string, bool) {
+func matchingAnswer(addresses []netip.Addr, accepted map[netip.Addr]struct{}) (string, bool) {
 	for _, address := range addresses {
-		parsed, ok := netip.AddrFromSlice(address)
-		if !ok || !parsed.Unmap().Is4() {
+		if !address.Unmap().Is4() {
 			continue
 		}
-		parsed = parsed.Unmap()
+		parsed := address.Unmap()
 		if len(accepted) == 0 {
 			return parsed.String(), true
 		}
@@ -379,6 +425,23 @@ func matchingAnswer(addresses []net.IP, accepted map[netip.Addr]struct{}) (strin
 		}
 	}
 	return "", false
+}
+
+func lookupDNSFromLookupIP(lookupIP lookupIPFunc) lookupDNSFunc {
+	return func(ctx context.Context, name string) (dnsResponse, error) {
+		addresses, err := lookupIP(ctx, "ip4", name)
+		if err != nil {
+			return dnsResponse{}, err
+		}
+		response := dnsResponse{rcode: dnsRcodeSuccess}
+		for _, address := range addresses {
+			parsed, ok := netip.AddrFromSlice(address)
+			if ok {
+				response.addresses = append(response.addresses, parsed.Unmap())
+			}
+		}
+		return response, nil
+	}
 }
 
 func (m *MatchDNSBL) logDebug(message string, fields ...zap.Field) {
