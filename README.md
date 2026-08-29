@@ -1,4 +1,4 @@
-# caddy-http-matchers-dnsbl2
+# caddy-http-matchers-dnsbl2 [![CI](https://github.com/gslin/caddy-http-matchers-dnsbl2/actions/workflows/ci.yml/badge.svg)](https://github.com/gslin/caddy-http-matchers-dnsbl2/actions/workflows/ci.yml)
 
 `caddy-http-matchers-dnsbl2` is a Caddy HTTP request matcher that checks a
 client IP address against one or more DNS blocklists (DNSBLs). The matcher is
