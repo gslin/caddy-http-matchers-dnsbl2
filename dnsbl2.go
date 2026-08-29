@@ -21,6 +21,7 @@ const (
 	defaultLookupTimeout = 2 * time.Second
 	defaultCacheSize     = 4096
 	defaultCacheMaxTTL   = time.Hour
+	defaultMaxConcurrent = 64
 )
 
 type lookupIPFunc func(context.Context, string, string) ([]net.IP, error)
@@ -59,11 +60,16 @@ type MatchDNSBL struct {
 	// CacheMaxTTL caps the TTL of cached DNS responses. The default is 1 hour.
 	CacheMaxTTL caddy.Duration `json:"cache_max_ttl,omitempty"`
 
-	lookupIP  lookupIPFunc
-	lookupDNS lookupDNSFunc
-	logger    *zap.Logger
-	rules     []providerRule
-	cache     *responseCache
+	// MaxConcurrent limits active DNS queries. Queries above the limit fail
+	// open. The default is 64.
+	MaxConcurrent int `json:"max_concurrent,omitempty"`
+
+	lookupIP    lookupIPFunc
+	lookupDNS   lookupDNSFunc
+	logger      *zap.Logger
+	rules       []providerRule
+	cache       *responseCache
+	coordinator *lookupCoordinator
 }
 
 type lookupResult struct {
@@ -117,6 +123,10 @@ func (m *MatchDNSBL) Provision(ctx caddy.Context) error {
 		m.CacheMaxTTL = caddy.Duration(defaultCacheMaxTTL)
 	}
 	m.cache = newResponseCache(m.CacheSize, time.Duration(m.CacheMaxTTL))
+	if m.MaxConcurrent == 0 {
+		m.MaxConcurrent = defaultMaxConcurrent
+	}
+	m.coordinator = newLookupCoordinator(ctx.Context, time.Duration(m.Timeout), m.MaxConcurrent, m.cache)
 	for i, resolver := range m.Resolvers {
 		m.Resolvers[i], _ = normalizeResolverAddress(resolver, "53")
 	}
@@ -149,6 +159,9 @@ func (m *MatchDNSBL) Validate() error {
 	}
 	if m.CacheMaxTTL < 0 {
 		return fmt.Errorf("cache max TTL must be greater than zero")
+	}
+	if m.MaxConcurrent < 0 {
+		return fmt.Errorf("max concurrent lookups must be greater than zero")
 	}
 	resolverSeen := make(map[string]struct{}, len(m.Resolvers))
 	for _, resolver := range m.Resolvers {
@@ -200,6 +213,7 @@ func (m *MatchDNSBL) Validate() error {
 //		resolvers <IP addresses...>
 //		cache_size <entries>
 //		cache_max_ttl <duration>
+//		max_concurrent <queries>
 //	}
 func (m *MatchDNSBL) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
@@ -280,6 +294,17 @@ func (m *MatchDNSBL) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("invalid cache max TTL %q", value)
 				}
 				m.CacheMaxTTL = caddy.Duration(maxTTL)
+
+			case "max_concurrent":
+				var value string
+				if !d.AllArgs(&value) {
+					return d.ArgErr()
+				}
+				maxConcurrent, err := strconv.Atoi(value)
+				if err != nil || maxConcurrent <= 0 {
+					return d.Errf("invalid max concurrent lookups %q", value)
+				}
+				m.MaxConcurrent = maxConcurrent
 
 			default:
 				return d.Errf("unrecognized dnsbl2 option: %s", d.Val())
@@ -369,28 +394,6 @@ func (m *MatchDNSBL) MatchWithError(r *http.Request) (bool, error) {
 	}
 
 	return false, nil
-}
-
-type resolveResult struct {
-	response dnsResponse
-	cacheHit bool
-}
-
-func (m *MatchDNSBL) resolve(ctx context.Context, query string, lookupDNS lookupDNSFunc) (resolveResult, error) {
-	if m.cache != nil {
-		if response, ok := m.cache.get(query); ok {
-			return resolveResult{response: response, cacheHit: true}, nil
-		}
-	}
-
-	response, err := lookupDNS(ctx, query)
-	if err != nil {
-		return resolveResult{}, err
-	}
-	if m.cache != nil {
-		m.cache.put(query, response)
-	}
-	return resolveResult{response: response}, nil
 }
 
 func requestClientIP(r *http.Request) (netip.Addr, error) {

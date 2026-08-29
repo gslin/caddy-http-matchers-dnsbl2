@@ -119,6 +119,23 @@ func TestUnmarshalCaddyfileCache(t *testing.T) {
 	}
 }
 
+func TestUnmarshalCaddyfileMaxConcurrent(t *testing.T) {
+	d := caddyfile.NewTestDispenser(`
+		dnsbl2 {
+			providers dnsbl.example
+			max_concurrent 12
+		}
+	`)
+
+	var matcher MatchDNSBL
+	if err := matcher.UnmarshalCaddyfile(d); err != nil {
+		t.Fatalf("unmarshal Caddyfile: %v", err)
+	}
+	if got, want := matcher.MaxConcurrent, 12; got != want {
+		t.Fatalf("max concurrent = %d, want %d", got, want)
+	}
+}
+
 func TestUnmarshalCaddyfileRejectsInvalidConfiguration(t *testing.T) {
 	tests := map[string]string{
 		"inline arguments":  `dnsbl2 example.test`,
@@ -193,6 +210,12 @@ func TestUnmarshalCaddyfileRejectsInvalidConfiguration(t *testing.T) {
 				cache_max_ttl never
 			}
 		`,
+		"invalid max concurrent": `
+			dnsbl2 {
+				providers example.test
+				max_concurrent 0
+			}
+		`,
 	}
 
 	for name, input := range tests {
@@ -247,6 +270,12 @@ func TestProvision(t *testing.T) {
 	}
 	if matcher.cache == nil {
 		t.Fatal("cache was not configured")
+	}
+	if got, want := matcher.MaxConcurrent, defaultMaxConcurrent; got != want {
+		t.Fatalf("max concurrent = %d, want %d", got, want)
+	}
+	if matcher.coordinator == nil {
+		t.Fatal("lookup coordinator was not configured")
 	}
 }
 
