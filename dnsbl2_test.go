@@ -55,6 +55,32 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 	}
 }
 
+func TestUnmarshalCaddyfileProviderAnswers(t *testing.T) {
+	d := caddyfile.NewTestDispenser(`
+		dnsbl2 {
+			provider spam.spamrats.com. {
+				answers 127.0.0.38
+			}
+		}
+	`)
+
+	var matcher MatchDNSBL
+	if err := matcher.UnmarshalCaddyfile(d); err != nil {
+		t.Fatalf("unmarshal Caddyfile: %v", err)
+	}
+
+	if got, want := len(matcher.ProviderConfigs), 1; got != want {
+		t.Fatalf("provider configs = %d, want %d", got, want)
+	}
+	provider := matcher.ProviderConfigs[0]
+	if got, want := provider.Zone, "spam.spamrats.com."; got != want {
+		t.Fatalf("provider zone = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(provider.Answers, ","), "127.0.0.38"; got != want {
+		t.Fatalf("provider answers = %q, want %q", got, want)
+	}
+}
+
 func TestUnmarshalCaddyfileRejectsInvalidConfiguration(t *testing.T) {
 	tests := map[string]string{
 		"inline arguments":  `dnsbl2 example.test`,
@@ -78,6 +104,27 @@ func TestUnmarshalCaddyfileRejectsInvalidConfiguration(t *testing.T) {
 			}
 		`,
 		"duplicate": `dnsbl2 { providers example.test EXAMPLE.TEST. }`,
+		"duplicate answer": `
+			dnsbl2 {
+				provider example.test {
+					answers 127.0.0.2 127.0.0.2
+				}
+			}
+		`,
+		"invalid answer": `
+			dnsbl2 {
+				provider example.test {
+					answers not-an-address
+				}
+			}
+		`,
+		"unknown provider option": `
+			dnsbl2 {
+				provider example.test {
+					unknown value
+				}
+			}
+		`,
 	}
 
 	for name, input := range tests {
@@ -238,6 +285,40 @@ func TestMatchWithErrorListed(t *testing.T) {
 	}
 	if !matched {
 		t.Fatal("expected request to match")
+	}
+}
+
+func TestMatchWithErrorFiltersProviderAnswers(t *testing.T) {
+	tests := []struct {
+		name      string
+		answer    net.IP
+		wantMatch bool
+	}{
+		{name: "accepted", answer: net.IPv4(127, 0, 0, 38), wantMatch: true},
+		{name: "not accepted", answer: net.IPv4(127, 0, 0, 2), wantMatch: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			matcher := MatchDNSBL{
+				ProviderConfigs: []Provider{{
+					Zone:    "spam.spamrats.com.",
+					Answers: []string{"127.0.0.38"},
+				}},
+				Timeout: caddy.Duration(time.Second),
+				lookupIP: func(context.Context, string, string) ([]net.IP, error) {
+					return []net.IP{test.answer}, nil
+				},
+			}
+
+			matched, err := matcher.MatchWithError(newRequest("192.0.2.45:1234"))
+			if err != nil {
+				t.Fatalf("match: %v", err)
+			}
+			if matched != test.wantMatch {
+				t.Fatalf("matched = %t, want %t", matched, test.wantMatch)
+			}
+		})
 	}
 }
 
