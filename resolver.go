@@ -113,18 +113,16 @@ func parseDNSResponse(message *dns.Msg) dnsResponse {
 	var ttl uint32
 	var ttlSet bool
 	for _, record := range message.Answer {
-		a, ok := record.(*dns.A)
-		if !ok {
-			continue
-		}
-		address, ok := netip.AddrFromSlice(a.A)
-		if !ok {
-			continue
-		}
-		response.addresses = append(response.addresses, address.Unmap())
-		if !ttlSet || a.Hdr.Ttl < ttl {
-			ttl = a.Hdr.Ttl
-			ttlSet = true
+		switch value := record.(type) {
+		case *dns.A:
+			address, ok := netip.AddrFromSlice(value.A)
+			if !ok {
+				continue
+			}
+			response.addresses = append(response.addresses, address.Unmap())
+			ttl, ttlSet = lowerTTL(ttl, ttlSet, value.Hdr.Ttl)
+		case *dns.CNAME:
+			ttl, ttlSet = lowerTTL(ttl, ttlSet, value.Hdr.Ttl)
 		}
 	}
 	if len(response.addresses) == 0 {
@@ -132,6 +130,13 @@ func parseDNSResponse(message *dns.Msg) dnsResponse {
 	}
 	response.ttl = time.Duration(ttl) * time.Second
 	return response
+}
+
+func lowerTTL(current uint32, set bool, candidate uint32) (uint32, bool) {
+	if !set || candidate < current {
+		return candidate, true
+	}
+	return current, set
 }
 
 func negativeTTL(records []dns.RR) uint32 {

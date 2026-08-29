@@ -88,6 +88,24 @@ func TestParseDNSResponsePreservesZeroTTL(t *testing.T) {
 	}
 }
 
+func TestParseDNSResponseUsesCNAMEChainTTL(t *testing.T) {
+	message := new(dns.Msg)
+	message.Answer = []dns.RR{
+		&dns.CNAME{
+			Hdr:    dns.RR_Header{Name: "listed.example.", Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: 30},
+			Target: "answer.example.",
+		},
+		&dns.A{
+			Hdr: dns.RR_Header{Name: "answer.example.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+			A:   net.IPv4(127, 0, 0, 2),
+		},
+	}
+
+	if got, want := parseDNSResponse(message).ttl, 30*time.Second; got != want {
+		t.Fatalf("TTL = %s, want %s", got, want)
+	}
+}
+
 func TestCustomResolver(t *testing.T) {
 	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
