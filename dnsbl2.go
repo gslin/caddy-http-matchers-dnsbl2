@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,7 +17,11 @@ import (
 	"go.uber.org/zap"
 )
 
-const defaultLookupTimeout = 2 * time.Second
+const (
+	defaultLookupTimeout = 2 * time.Second
+	defaultCacheSize     = 4096
+	defaultCacheMaxTTL   = time.Hour
+)
 
 type lookupIPFunc func(context.Context, string, string) ([]net.IP, error)
 
@@ -47,10 +52,18 @@ type MatchDNSBL struct {
 	// ports. The operating system configuration is used by default.
 	Resolvers []string `json:"resolvers,omitempty"`
 
+	// CacheSize is the maximum number of DNS responses retained in memory. The
+	// default is 4096.
+	CacheSize int `json:"cache_size,omitempty"`
+
+	// CacheMaxTTL caps the TTL of cached DNS responses. The default is 1 hour.
+	CacheMaxTTL caddy.Duration `json:"cache_max_ttl,omitempty"`
+
 	lookupIP  lookupIPFunc
 	lookupDNS lookupDNSFunc
 	logger    *zap.Logger
 	rules     []providerRule
+	cache     *responseCache
 }
 
 type lookupResult struct {
@@ -97,6 +110,13 @@ func (m *MatchDNSBL) Provision(ctx caddy.Context) error {
 	if m.Timeout == 0 {
 		m.Timeout = caddy.Duration(defaultLookupTimeout)
 	}
+	if m.CacheSize == 0 {
+		m.CacheSize = defaultCacheSize
+	}
+	if m.CacheMaxTTL == 0 {
+		m.CacheMaxTTL = caddy.Duration(defaultCacheMaxTTL)
+	}
+	m.cache = newResponseCache(m.CacheSize, time.Duration(m.CacheMaxTTL))
 	for i, resolver := range m.Resolvers {
 		m.Resolvers[i], _ = normalizeResolverAddress(resolver, "53")
 	}
@@ -123,6 +143,12 @@ func (m *MatchDNSBL) Validate() error {
 	}
 	if m.Timeout < 0 {
 		return fmt.Errorf("timeout must be greater than zero")
+	}
+	if m.CacheSize < 0 {
+		return fmt.Errorf("cache size must be greater than zero")
+	}
+	if m.CacheMaxTTL < 0 {
+		return fmt.Errorf("cache max TTL must be greater than zero")
 	}
 	resolverSeen := make(map[string]struct{}, len(m.Resolvers))
 	for _, resolver := range m.Resolvers {
@@ -172,6 +198,8 @@ func (m *MatchDNSBL) Validate() error {
 //		}
 //		timeout <duration>
 //		resolvers <IP addresses...>
+//		cache_size <entries>
+//		cache_max_ttl <duration>
 //	}
 func (m *MatchDNSBL) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
@@ -231,6 +259,28 @@ func (m *MatchDNSBL) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				m.Resolvers = append(m.Resolvers, resolvers...)
 
+			case "cache_size":
+				var value string
+				if !d.AllArgs(&value) {
+					return d.ArgErr()
+				}
+				cacheSize, err := strconv.Atoi(value)
+				if err != nil || cacheSize <= 0 {
+					return d.Errf("invalid cache size %q", value)
+				}
+				m.CacheSize = cacheSize
+
+			case "cache_max_ttl":
+				var value string
+				if !d.AllArgs(&value) {
+					return d.ArgErr()
+				}
+				maxTTL, err := caddy.ParseDuration(value)
+				if err != nil || maxTTL <= 0 {
+					return d.Errf("invalid cache max TTL %q", value)
+				}
+				m.CacheMaxTTL = caddy.Duration(maxTTL)
+
 			default:
 				return d.Errf("unrecognized dnsbl2 option: %s", d.Val())
 			}
@@ -282,7 +332,8 @@ func (m *MatchDNSBL) MatchWithError(r *http.Request) (bool, error) {
 		query := dnsblQuery(clientIP, rule.zone)
 
 		go func() {
-			response, lookupErr := lookupDNS(ctx, query)
+			resolved, lookupErr := m.resolve(ctx, query, lookupDNS)
+			response := resolved.response
 			answer, listed := matchingAnswer(response.addresses, rule.answers)
 			results <- lookupResult{
 				provider: rule.zone,
@@ -318,6 +369,28 @@ func (m *MatchDNSBL) MatchWithError(r *http.Request) (bool, error) {
 	}
 
 	return false, nil
+}
+
+type resolveResult struct {
+	response dnsResponse
+	cacheHit bool
+}
+
+func (m *MatchDNSBL) resolve(ctx context.Context, query string, lookupDNS lookupDNSFunc) (resolveResult, error) {
+	if m.cache != nil {
+		if response, ok := m.cache.get(query); ok {
+			return resolveResult{response: response, cacheHit: true}, nil
+		}
+	}
+
+	response, err := lookupDNS(ctx, query)
+	if err != nil {
+		return resolveResult{}, err
+	}
+	if m.cache != nil {
+		m.cache.put(query, response)
+	}
+	return resolveResult{response: response}, nil
 }
 
 func requestClientIP(r *http.Request) (netip.Addr, error) {

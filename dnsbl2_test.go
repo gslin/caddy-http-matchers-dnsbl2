@@ -98,6 +98,27 @@ func TestUnmarshalCaddyfileResolvers(t *testing.T) {
 	}
 }
 
+func TestUnmarshalCaddyfileCache(t *testing.T) {
+	d := caddyfile.NewTestDispenser(`
+		dnsbl2 {
+			providers dnsbl.example
+			cache_size 512
+			cache_max_ttl 15m
+		}
+	`)
+
+	var matcher MatchDNSBL
+	if err := matcher.UnmarshalCaddyfile(d); err != nil {
+		t.Fatalf("unmarshal Caddyfile: %v", err)
+	}
+	if got, want := matcher.CacheSize, 512; got != want {
+		t.Fatalf("cache size = %d, want %d", got, want)
+	}
+	if got, want := time.Duration(matcher.CacheMaxTTL), 15*time.Minute; got != want {
+		t.Fatalf("cache max TTL = %s, want %s", got, want)
+	}
+}
+
 func TestUnmarshalCaddyfileRejectsInvalidConfiguration(t *testing.T) {
 	tests := map[string]string{
 		"inline arguments":  `dnsbl2 example.test`,
@@ -160,6 +181,18 @@ func TestUnmarshalCaddyfileRejectsInvalidConfiguration(t *testing.T) {
 				resolvers 127.0.0.1 127.0.0.1:53
 			}
 		`,
+		"invalid cache size": `
+			dnsbl2 {
+				providers example.test
+				cache_size 0
+			}
+		`,
+		"invalid cache TTL": `
+			dnsbl2 {
+				providers example.test
+				cache_max_ttl never
+			}
+		`,
 	}
 
 	for name, input := range tests {
@@ -205,6 +238,15 @@ func TestProvision(t *testing.T) {
 	}
 	if matcher.lookupDNS == nil {
 		t.Fatal("resolver was not configured")
+	}
+	if got, want := matcher.CacheSize, defaultCacheSize; got != want {
+		t.Fatalf("cache size = %d, want %d", got, want)
+	}
+	if got, want := time.Duration(matcher.CacheMaxTTL), defaultCacheMaxTTL; got != want {
+		t.Fatalf("cache max TTL = %s, want %s", got, want)
+	}
+	if matcher.cache == nil {
+		t.Fatal("cache was not configured")
 	}
 }
 

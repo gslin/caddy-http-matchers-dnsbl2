@@ -11,7 +11,10 @@ import (
 	"github.com/miekg/dns"
 )
 
-const dnsRcodeSuccess = dns.RcodeSuccess
+const (
+	dnsRcodeSuccess   = dns.RcodeSuccess
+	dnsRcodeNameError = dns.RcodeNameError
+)
 
 type dnsResponse struct {
 	addresses []netip.Addr
