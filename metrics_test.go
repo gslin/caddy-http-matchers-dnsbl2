@@ -81,6 +81,7 @@ func TestLookupMetricResult(t *testing.T) {
 		{name: "no answer", response: dnsResponse{rcode: dnsRcodeSuccess}, want: "no_answer"},
 		{name: "NXDOMAIN", response: dnsResponse{rcode: dnsRcodeNameError}, want: "nxdomain"},
 		{name: "SERVFAIL", response: dnsResponse{rcode: 2}, want: "servfail"},
+		{name: "unknown RCODE", response: dnsResponse{rcode: 999}, want: "other_rcode"},
 		{name: "timeout", err: context.DeadlineExceeded, want: "timeout"},
 		{name: "canceled", err: context.Canceled, want: "canceled"},
 		{name: "error", err: errors.New("resolver failed"), want: "error"},

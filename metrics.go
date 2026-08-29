@@ -154,7 +154,11 @@ func lookupMetricResult(response dnsResponse, err error) string {
 		}
 		return "no_answer"
 	}
-	return strings.ToLower(dnsRcodeName(response.rcode))
+	name := dnsRcodeName(response.rcode)
+	if name == fmt.Sprintf("%d", response.rcode) {
+		return "other_rcode"
+	}
+	return strings.ToLower(name)
 }
 
 func (m *dnsblMetrics) setProviderHealth(provider string, status providerHealthStatus) {
